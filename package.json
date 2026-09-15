@@ -12,9 +12,12 @@
     "npm": ">=11 <12"
   },
   "scripts": {
-    "dev": "npm run build -w @checkout/contracts && npm run dev -w @checkout/api",
-    "build": "npm run build -w @checkout/contracts && npm run build -w @checkout/api",
+    "dev": "npm run build -w @checkout/contracts && concurrently --kill-others-on-fail -n api,web -c cyan,magenta \"npm run dev -w @checkout/api\" \"npm run dev -w @checkout/web\"",
+    "dev:api": "npm run build -w @checkout/contracts && npm run dev -w @checkout/api",
+    "dev:web": "npm run dev -w @checkout/web",
+    "build": "npm run build -w @checkout/contracts && npm run build -w @checkout/api && npm run build -w @checkout/web",
     "start": "npm run start -w @checkout/api",
+    "start:web": "npm run start -w @checkout/web",
     "test": "npm run build && npm run test -w @checkout/api",
     "docs:generate": "npm run build && node scripts/openapi.mjs --write",
     "docs:check": "node scripts/openapi.mjs",
@@ -29,6 +32,7 @@
     "@types/node": "24.13.3",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
+    "concurrently": "9.2.1",
     "prettier": "3.9.6",
     "tsx": "4.23.13",
     "typescript": "5.9.3"

@@ -1,0 +1,14 @@
+.notice {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #ece7dc;
+}
+
+.notice_error {
+  background: #f4e4e1;
+}
+
+.notice_ok {
+  background: #e3eee4;
+}
