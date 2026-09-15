@@ -1,11 +1,15 @@
 export async function pollUntil<T>(params: {
-  read: (signal: AbortSignal) => Promise<T>;
+  read: (signal: AbortSignal) => Promise<{
+    value: T;
+    retryAfterMs: number | null;
+  }>;
   isFinal: (value: T) => boolean;
-  delayMs: (value: T) => number;
+  delayMs: (value: T, retryAfterMs: number | null) => number;
   signal: AbortSignal;
   isCurrent: () => boolean;
 }): Promise<T | null> {
   let latest: T | undefined;
+  let retryAfterMs: number | null = null;
 
   while (!params.signal.aborted) {
     if (!params.isCurrent()) {
@@ -13,7 +17,9 @@ export async function pollUntil<T>(params: {
     }
 
     try {
-      latest = await params.read(params.signal);
+      const result = await params.read(params.signal);
+      latest = result.value;
+      retryAfterMs = result.retryAfterMs;
     } catch (error) {
       if (params.signal.aborted || !params.isCurrent()) {
         return null;
@@ -34,7 +40,7 @@ export async function pollUntil<T>(params: {
     }
 
     try {
-      await wait(params.delayMs(latest), params.signal);
+      await waitFor(params.delayMs(latest, retryAfterMs), params.signal);
     } catch {
       return null;
     }
@@ -43,7 +49,7 @@ export async function pollUntil<T>(params: {
   return null;
 }
 
-function wait(ms: number, signal: AbortSignal): Promise<void> {
+export function waitFor(ms: number, signal: AbortSignal): Promise<void> {
   const duration = Math.max(0, ms);
   if (duration === 0) {
     return Promise.resolve();
@@ -59,4 +65,11 @@ function wait(ms: number, signal: AbortSignal): Promise<void> {
     };
     signal.addEventListener('abort', onAbort, { once: true });
   });
+}
+
+export function pollDelayMs(retryAfterMs: number | null, fallbackMs: number): number {
+  if (retryAfterMs != null && retryAfterMs > 0) {
+    return retryAfterMs;
+  }
+  return Math.max(fallbackMs, 300);
 }

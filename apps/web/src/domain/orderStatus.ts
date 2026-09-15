@@ -1,4 +1,8 @@
-import type { OrderStatus } from '@/api/types';
+import type { Order, OrderStatus } from '@/api/types';
+
+export function isOrderPaid(order: Order): boolean {
+  return order.status === 'paid' && order.paymentStatus === 'succeeded';
+}
 
 export function orderStatusLabel(status: OrderStatus): string {
   if (status === 'paid') {

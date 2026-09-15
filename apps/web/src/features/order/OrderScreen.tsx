@@ -1,15 +1,14 @@
 'use client';
 
-import { hasApiCode, isAbortError, isApiError } from '@/api/error';
-import { pollUntil } from '@/api/poll';
+import { isAbortError, isApiError } from '@/api/error';
 import { getOrder, listOrderPayments } from '@/api/resources/orders';
-import { getPayment } from '@/api/resources/payments';
-import { getSandbox } from '@/api/resources/sandbox';
-import type { Order, Payment, SandboxCard } from '@/api/types';
+import type { Order } from '@/api/types';
 import { describeDelivery } from '@/domain/deliveryText';
 import { findActivePayment } from '@/domain/indexes';
+import { isOrderPaid } from '@/domain/orderStatus';
 import { PaymentDialog } from '@/features/payment/PaymentDialog';
-import { isFinalPaymentStatus, runCardPayment } from '@/features/payment/runCardPayment';
+import { paymentPollFallbackMs, watchPayment } from '@/features/payment/runCardPayment';
+import { useSandboxPayment } from '@/features/payment/useSandboxPayment';
 import { formatRubFromKopecks } from '@/lib/money';
 import { sessionStore } from '@/session/storage';
 import { withToken } from '@/session/withToken';
@@ -23,137 +22,81 @@ export function OrderScreen({ orderId }: { orderId: string }) {
   const router = useRouter();
   const [order, setOrder] = useState<Order | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [waiting, setWaiting] = useState(false);
-  const [payOpen, setPayOpen] = useState(false);
-  const [cards, setCards] = useState<SandboxCard[]>([]);
-  const [cardId, setCardId] = useState('');
-  const [payBusy, setPayBusy] = useState(false);
-  const [payError, setPayError] = useState<string | null>(null);
-  const [delayMs, setDelayMs] = useState(400);
-  const generation = useRef(0);
-  const payLock = useRef(false);
+  const [resumeWait, setResumeWait] = useState(false);
+  const loadAbort = useRef<AbortController | null>(null);
+
+  const payment = useSandboxPayment({
+    orderId: order?.id,
+    onPaid: (next) => {
+      setOrder(next);
+    },
+    onFailed: (next) => {
+      setOrder(next);
+    },
+    onCancelled: (next) => {
+      setOrder(next);
+    },
+    onPayStart: () => {
+      loadAbort.current?.abort();
+      setResumeWait(false);
+    },
+  });
 
   useEffect(() => {
     const controller = new AbortController();
-    const current = ++generation.current;
+    loadAbort.current = controller;
     setError(null);
     void (async () => {
       try {
         const result = await withToken((token) => getOrder(orderId, token, controller.signal));
-        if (generation.current !== current) {
+        if (controller.signal.aborted) {
           return;
         }
         setOrder(result.data);
         sessionStore.setOrderId(result.data.id);
-        if (result.data.paymentStatus === 'pending') {
-          setWaiting(true);
-          const payments = await withToken((token) =>
-            listOrderPayments(orderId, token, controller.signal),
-          );
-          const active = findActivePayment(payments.data);
-          if (active) {
-            sessionStore.setPaymentId(active.id);
-            const polled = await pollUntil<Payment>({
-              read: async (signal) => {
-                const payment = await withToken((token) => getPayment(active.id, token, signal));
-                return payment.data;
-              },
-              isFinal: (value) => isFinalPaymentStatus(value.status),
-              delayMs: () => 400,
-              signal: controller.signal,
-              isCurrent: () => generation.current === current,
-            });
-            if (generation.current !== current) {
-              return;
-            }
-            const fresh = await withToken((token) => getOrder(orderId, token, controller.signal));
-            setOrder(fresh.data);
-            if (polled && !isFinalPaymentStatus(polled.status)) {
-              setWaiting(true);
-            } else {
-              setWaiting(false);
-            }
-          } else {
-            setWaiting(false);
-          }
+        if (result.data.paymentStatus !== 'pending') {
+          return;
         }
+        setResumeWait(true);
+        const payments = await withToken((token) =>
+          listOrderPayments(orderId, token, controller.signal),
+        );
+        if (controller.signal.aborted) {
+          return;
+        }
+        const active = findActivePayment(payments.data);
+        if (!active) {
+          setResumeWait(false);
+          return;
+        }
+        sessionStore.setPaymentId(active.id);
+        await watchPayment({
+          paymentId: active.id,
+          signal: controller.signal,
+          isCurrent: () => !controller.signal.aborted,
+          fallbackDelayMs: paymentPollFallbackMs(),
+        });
+        if (controller.signal.aborted) {
+          return;
+        }
+        const fresh = await withToken((token) => getOrder(orderId, token, controller.signal));
+        if (controller.signal.aborted) {
+          return;
+        }
+        setOrder(fresh.data);
+        setResumeWait(false);
       } catch (err) {
-        if (isAbortError(err) || generation.current !== current) {
+        if (isAbortError(err) || controller.signal.aborted) {
           return;
         }
         setError(isApiError(err) ? err.message : 'Не удалось загрузить заказ.');
+        setResumeWait(false);
       }
     })();
     return () => {
-      generation.current += 1;
       controller.abort();
     };
   }, [orderId]);
-
-  const retryPay = async (scenario: 'success' | 'decline' | 'cancel') => {
-    if (!order || payLock.current) {
-      return;
-    }
-    payLock.current = true;
-    const current = ++generation.current;
-    const controller = new AbortController();
-    setPayBusy(true);
-    setPayError(null);
-    if (scenario !== 'cancel') {
-      setWaiting(true);
-    }
-    try {
-      const result = await runCardPayment({
-        orderId: order.id,
-        scenario,
-        signal: controller.signal,
-        isCurrent: () => generation.current === current,
-        delayMs,
-      });
-      if (!result || generation.current !== current) {
-        return;
-      }
-      setOrder(result.order);
-      if (result.order.status === 'paid') {
-        setPayOpen(false);
-        setWaiting(false);
-        return;
-      }
-      if (result.payment.status === 'failed') {
-        setPayError('Банк отказал в оплате. Можно повторить.');
-      }
-      if (result.payment.status === 'cancelled') {
-        setPayOpen(false);
-        setPayError('Оплата отменена.');
-      }
-    } catch (err) {
-      if (hasApiCode(err, 'ORDER_ALREADY_PAID')) {
-        const fresh = await withToken((token) => getOrder(orderId, token));
-        setOrder(fresh.data);
-        setPayOpen(false);
-        return;
-      }
-      setPayError(isApiError(err) ? err.message : 'Не удалось оплатить.');
-    } finally {
-      payLock.current = false;
-      setPayBusy(false);
-      setWaiting(false);
-    }
-  };
-
-  const openPay = async () => {
-    try {
-      const sandbox = await getSandbox();
-      setCards(sandbox.data.cards);
-      setDelayMs(Math.min(sandbox.data.settlementDelayMs || 400, 800));
-      if (sandbox.data.cards[0]) {
-        setCardId(sandbox.data.cards[0].id);
-      }
-      setPayOpen(true);
-    } catch (err) {
-      setError(isApiError(err) ? err.message : 'Не удалось загрузить тестовые карты.');
-    }
-  };
 
   if (error && !order) {
     return (
@@ -170,10 +113,10 @@ export function OrderScreen({ orderId }: { orderId: string }) {
     return <Notice>Загружаем заказ…</Notice>;
   }
 
-  const paid = order.status === 'paid' && order.paymentStatus === 'succeeded';
+  const paid = isOrderPaid(order);
   const cash = order.paymentMethod === 'cash_on_delivery';
   const canPay = order.status === 'awaiting_payment';
-  const selected = cards.find((card) => card.id === cardId);
+  const waiting = resumeWait || payment.waiting;
 
   return (
     <section>
@@ -184,7 +127,9 @@ export function OrderScreen({ orderId }: { orderId: string }) {
       {canPay && !waiting ? (
         <Notice>Заказ ещё не оплачен. Можно повторить оплату картой.</Notice>
       ) : null}
-      {payError ? <Notice tone="error">{payError}</Notice> : null}
+      {payment.error && !payment.dialogProps ? (
+        <Notice tone="error">{payment.error}</Notice>
+      ) : null}
       <div className={styles.order__card}>
         <p>Статус заказа: {order.status}</p>
         <p>Оплата: {order.paymentStatus}</p>
@@ -205,7 +150,14 @@ export function OrderScreen({ orderId }: { orderId: string }) {
       </div>
       <div className={styles.order__actions}>
         {canPay ? (
-          <Button type="button" onClick={() => void openPay()}>
+          <Button
+            type="button"
+            onClick={() => {
+              void payment.openDialog().catch((err: unknown) => {
+                setError(isApiError(err) ? err.message : 'Не удалось загрузить тестовые карты.');
+              });
+            }}
+          >
             Оплатить картой
           </Button>
         ) : null}
@@ -216,22 +168,7 @@ export function OrderScreen({ orderId }: { orderId: string }) {
           В каталог
         </Button>
       </div>
-      {payOpen ? (
-        <PaymentDialog
-          cards={cards}
-          selectedId={cardId}
-          onSelect={setCardId}
-          busy={payBusy}
-          waiting={waiting}
-          error={payError}
-          onPay={() => {
-            void retryPay(selected?.scenario ?? 'success');
-          }}
-          onCancel={() => {
-            void retryPay('cancel');
-          }}
-        />
-      ) : null}
+      {payment.dialogProps ? <PaymentDialog {...payment.dialogProps} /> : null}
     </section>
   );
 }

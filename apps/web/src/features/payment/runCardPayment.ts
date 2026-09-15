@@ -1,5 +1,5 @@
 import { ApiError, hasApiCode } from '@/api/error';
-import { pollUntil } from '@/api/poll';
+import { pollDelayMs, pollUntil, waitFor } from '@/api/poll';
 import { createOrderPayment, getOrder, listOrderPayments } from '@/api/resources/orders';
 import { createPaymentSimulation, getPayment } from '@/api/resources/payments';
 import type { Order, Payment, PaymentScenario } from '@/api/types';
@@ -11,6 +11,32 @@ import { withToken } from '@/session/withToken';
 
 export function isFinalPaymentStatus(status: string): boolean {
   return status === 'succeeded' || status === 'failed' || status === 'cancelled';
+}
+
+export function paymentPollFallbackMs(settlementDelayMs?: number): number {
+  if (!settlementDelayMs) {
+    return 400;
+  }
+  return Math.min(settlementDelayMs, 800);
+}
+
+export async function watchPayment(params: {
+  paymentId: string;
+  signal: AbortSignal;
+  isCurrent: () => boolean;
+  fallbackDelayMs: number;
+}): Promise<Payment | null> {
+  const { paymentId, signal, isCurrent, fallbackDelayMs } = params;
+  return pollUntil<Payment>({
+    read: async (pollSignal) => {
+      const result = await withToken((token) => getPayment(paymentId, token, pollSignal));
+      return { value: result.data, retryAfterMs: result.retryAfterMs };
+    },
+    isFinal: (value) => isFinalPaymentStatus(value.status),
+    delayMs: (_value, retryAfterMs) => pollDelayMs(retryAfterMs, fallbackDelayMs),
+    signal,
+    isCurrent,
+  });
 }
 
 export async function runCardPayment(params: {
@@ -54,18 +80,26 @@ export async function runCardPayment(params: {
   sessionStore.setPaymentId(payment.id);
 
   if (payment.status === 'pending') {
-    await withToken((token) => createPaymentSimulation(payment.id, scenario, token, signal));
+    const simulation = await withToken((token) =>
+      createPaymentSimulation(payment.id, scenario, token, signal),
+    );
+    if (!isCurrent()) {
+      return null;
+    }
+    if (simulation.retryAfterMs != null && simulation.retryAfterMs > 0) {
+      try {
+        await waitFor(simulation.retryAfterMs, signal);
+      } catch {
+        return null;
+      }
+    }
   }
 
-  const polled = await pollUntil({
-    read: async (pollSignal) => {
-      const result = await withToken((token) => getPayment(payment.id, token, pollSignal));
-      return result.data;
-    },
-    isFinal: (value) => isFinalPaymentStatus(value.status),
-    delayMs: () => Math.max(delayMs, 300),
+  const polled = await watchPayment({
+    paymentId: payment.id,
     signal,
     isCurrent,
+    fallbackDelayMs: delayMs,
   });
 
   if (!polled || !isCurrent()) {

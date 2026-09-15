@@ -17,7 +17,7 @@ import {
 } from '@/domain/checkoutRules';
 import { formatPhoneMask, phoneFromInput } from '@/domain/phone';
 import { PaymentDialog } from '@/features/payment/PaymentDialog';
-import { runCardPayment } from '@/features/payment/runCardPayment';
+import { useSandboxPayment } from '@/features/payment/useSandboxPayment';
 import { formatRubFromKopecks } from '@/lib/money';
 import { formDraftKey, readJson, writeJson } from '@/session/browserStore';
 import { idempotencyKeyFor } from '@/session/idempotency';
@@ -42,16 +42,22 @@ export function CheckoutScreen() {
   const [sandbox, setSandbox] = useState<Sandbox | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [unpaidOrder, setUnpaidOrder] = useState<Order | null>(null);
-  const [payOpen, setPayOpen] = useState(false);
-  const [cardId, setCardId] = useState('');
-  const [payBusy, setPayBusy] = useState(false);
-  const [payWait, setPayWait] = useState(false);
-  const [payError, setPayError] = useState<string | null>(null);
-  const submitLock = useRef(false);
-  const payLock = useRef(false);
-  const payGeneration = useRef(0);
-
   const [hydrated, setHydrated] = useState(false);
+  const submitLock = useRef(false);
+  const payment = useSandboxPayment({
+    orderId: unpaidOrder?.id,
+    sandbox,
+    onPaid: (order) => {
+      sessionStore.setPaymentId(null);
+      router.push(`/orders/${order.id}`);
+    },
+    onFailed: (order) => {
+      setUnpaidOrder(order);
+    },
+    onCancelled: (order) => {
+      setUnpaidOrder(order);
+    },
+  });
 
   useEffect(() => {
     const saved = readJson<CheckoutDraft>(formDraftKey);
@@ -88,9 +94,6 @@ export function CheckoutScreen() {
         }
         setOptions(nextOptions.data);
         setSandbox(nextSandbox.data);
-        if (nextSandbox.data.cards[0]) {
-          setCardId((current) => current || nextSandbox.data.cards[0].id);
-        }
         const pickup = nextOptions.data.deliveryMethods.find((method) => method.id === 'pickup');
         if (pickup?.pickupPoints[0]) {
           setDraft((current) =>
@@ -220,7 +223,7 @@ export function CheckoutScreen() {
         return;
       }
       setUnpaidOrder(created.data);
-      setPayOpen(true);
+      await payment.openDialog();
     } catch (error) {
       if (hasApiCode(error, 'CART_VERSION_CONFLICT') || hasApiCode(error, 'QUOTE_EXPIRED')) {
         await shop.refreshCart();
@@ -233,55 +236,6 @@ export function CheckoutScreen() {
       }
     } finally {
       submitLock.current = false;
-    }
-  };
-
-  const pay = async (scenario: 'success' | 'decline' | 'cancel') => {
-    if (!unpaidOrder || payLock.current) {
-      return;
-    }
-    payLock.current = true;
-    const generation = payGeneration.current + 1;
-    payGeneration.current = generation;
-    const controller = new AbortController();
-    setPayBusy(true);
-    setPayError(null);
-    if (scenario !== 'cancel') {
-      setPayWait(true);
-    }
-    try {
-      const result = await runCardPayment({
-        orderId: unpaidOrder.id,
-        scenario,
-        signal: controller.signal,
-        isCurrent: () => payGeneration.current === generation,
-        delayMs: sandbox?.settlementDelayMs ? Math.min(sandbox.settlementDelayMs, 800) : 400,
-      });
-      if (!result || payGeneration.current !== generation) {
-        return;
-      }
-      if (result.order.status === 'paid' && result.order.paymentStatus === 'succeeded') {
-        sessionStore.setPaymentId(null);
-        router.push(`/orders/${result.order.id}`);
-        return;
-      }
-      if (result.payment.status === 'failed') {
-        setPayError('Банк отказал в оплате. Можно выбрать карту и повторить.');
-        setUnpaidOrder(result.order);
-      } else if (result.payment.status === 'cancelled') {
-        setPayError('Оплата отменена. Заказ сохранён, можно оплатить снова.');
-        setUnpaidOrder(result.order);
-        setPayOpen(false);
-      }
-    } catch (error) {
-      if (isAbortError(error)) {
-        return;
-      }
-      setPayError(isApiError(error) ? error.message : 'Не удалось выполнить оплату.');
-    } finally {
-      payLock.current = false;
-      setPayBusy(false);
-      setPayWait(false);
     }
   };
 
@@ -302,20 +256,22 @@ export function CheckoutScreen() {
 
   const emptyCart = !shop.cart || shop.cart.items.length === 0;
   const pickup = options?.deliveryMethods.find((method) => method.id === 'pickup');
-  const selectedCard = sandbox?.cards.find((card) => card.id === cardId);
 
   return (
     <section>
       <h1 className={styles.checkout__title}>Оформление</h1>
       {formError ? <Notice tone="error">{formError}</Notice> : null}
+      {!payment.dialogProps && payment.error ? (
+        <Notice tone="error">{payment.error}</Notice>
+      ) : null}
       {unpaidOrder ? (
         <Notice>
-          Есть заказ {unpaidOrder.number} с неоплаченной картой.{' '}
+          Есть заказ {unpaidOrder.number}, не оплаченный картой.{' '}
           <Button
             type="button"
             variant="ghost"
             onClick={() => {
-              setPayOpen(true);
+              void payment.openDialog();
             }}
           >
             Оплатить
@@ -457,23 +413,7 @@ export function CheckoutScreen() {
           </Button>
         </form>
       )}
-      {payOpen && sandbox ? (
-        <PaymentDialog
-          cards={sandbox.cards}
-          selectedId={cardId}
-          onSelect={setCardId}
-          busy={payBusy}
-          waiting={payWait}
-          error={payError}
-          onPay={() => {
-            const scenario = selectedCard?.scenario ?? 'success';
-            void pay(scenario);
-          }}
-          onCancel={() => {
-            void pay('cancel');
-          }}
-        />
-      ) : null}
+      {payment.dialogProps ? <PaymentDialog {...payment.dialogProps} /> : null}
     </section>
   );
 }
